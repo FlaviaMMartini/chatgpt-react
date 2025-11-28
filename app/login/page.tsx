@@ -1,15 +1,24 @@
 "use client";
 
-import React, { useEffect } from "react";
-import { Button, Card, Typography } from "antd";
+import React from "react";
+import { Card, Button, Typography } from "antd";
 import { GoogleOutlined } from "@ant-design/icons";
 import { signInWithPopup } from "firebase/auth";
+
+import { useRouter } from "next/navigation";
 import { auth, provider } from "../api/chat/client";
 
-
 export default function LoginPage() {
+  const router = useRouter();
+
   const handleGoogleLogin = async () => {
-    await signInWithPopup(auth, provider);
+    try {
+      await signInWithPopup(auth, provider);
+      router.push("/chatpage");
+    } catch (error) {
+      console.error("Erro login:", error);
+      alert("Erro ao autenticar com Google.");
+    }
   };
 
   return (
@@ -18,16 +27,16 @@ export default function LoginPage() {
       display: "flex",
       justifyContent: "center",
       alignItems: "center",
-      background: "#f0f2f5",
+      background: "#f0f2f5"
     }}>
-      <Card style={{ width: 320, textAlign: "center", padding: 20 }}>
+      <Card style={{ width: 360, textAlign: "center" }}>
         <Typography.Title level={3}>Entrar</Typography.Title>
         <Button
           type="primary"
           icon={<GoogleOutlined />}
-          onClick={handleGoogleLogin}
           block
           size="large"
+          onClick={handleGoogleLogin}
         >
           Entrar com Google
         </Button>

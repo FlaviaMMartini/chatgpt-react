@@ -2,6 +2,35 @@ import { ALLOWED_MODELS, MODEL_GROUPS } from "@/app/components/models";
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 
+let admin: any = null;
+let adminFirestore: any = null;
+try {
+  if (process.env.FIREBASE_ADMIN_PROJECT_ID && process.env.FIREBASE_ADMIN_CLIENT_EMAIL && process.env.FIREBASE_ADMIN_PRIVATE_KEY) {
+
+    admin = require("firebase-admin");
+
+    if (!admin.apps || admin.apps.length === 0) {
+      const privateKey = process.env.FIREBASE_ADMIN_PRIVATE_KEY.replace(/\\n/g, "\n");
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId: process.env.FIREBASE_ADMIN_PROJECT_ID,
+          clientEmail: process.env.FIREBASE_ADMIN_CLIENT_EMAIL,
+          privateKey,
+        }),
+      });
+    }
+    adminFirestore = admin.firestore();
+    console.log("[chat/route] Firebase Admin inicializado");
+  } else {
+    admin = null;
+    adminFirestore = null;
+  }
+} catch (err: any) {
+  console.warn("[chat/route] falha ao inicializar Firebase Admin (ignorando, continuará sem Firestore server-side):", err?.message ?? err);
+  admin = null;
+  adminFirestore = null;
+}
+
 const groqClient = new OpenAI({
   apiKey: process.env.GROQ_API_KEY,
   baseURL: "https://api.groq.com/openai/v1",
@@ -14,23 +43,63 @@ type Role = "user" | "assistant";
 type ChatHistoryItem = { role: Role; content: string; ts?: string };
 type ModelMessage = { role: "system" | "user" | "assistant"; content: string };
 
-const sessionHistories = new Map<string, ChatHistoryItem[]>();
 const MAX_HISTORY_MESSAGES = 40;
-const DEFAULT_MAX_HISTORY_SEND = 8;
 
 function normalizeContentToString(input: unknown): string {
   if (input === null || input === undefined) return "";
   return String(input).trim();
 }
 
-function pushToSessionHistory(sessionId: string, item: ChatHistoryItem) {
-  const hist = sessionHistories.get(sessionId) ?? [];
-  hist.push({ ...item, ts: new Date().toISOString() });
-  sessionHistories.set(sessionId, hist.slice(-MAX_HISTORY_MESSAGES));
+function sanitizeModelReply(text: string): string {
+  if (!text) return text;
+  let s = text;
+
+  // 1) remove tags <think>...</think> (case insensitive)
+  s = s.replace(/<\s*think\b[^>]*>[\s\S]*?<\s*\/\s*think\s*>/gi, "");
+
+  // 2) remove possíveis blocos de pensamento com outras tags como [THINK]...[/THINK]
+  s = s.replace(/\[think\][\s\S]*?\[\/think\]/gi, "");
+  s = s.replace(/\[thought\][\s\S]*?\[\/thought\]/gi, "");
+
+  // 3) remove linhas que começam com "<think>" estilo inline
+  s = s.replace(/^\s*<\s*think[^>]*>.*$/gmi, "");
+
+  // 4) remover marcadores de debug (e.g. <<<...>>>) e similares
+  s = s.replace(/<{3}[\s\S]*?>{3}/g, "");
+  s = s.replace(/<<[\s\S]*?>>/g, "");
+
+  // 5) remover sinais típicos de prompt-injection debug
+  s = s.replace(/\[DEBUG\][\s\S]*?\[\/DEBUG\]/gi, "");
+
+  // 6) trim e normaliza quebras de linha repetidas
+  s = s.replace(/\n{3,}/g, "\n\n").trim();
+
+  return s;
 }
 
-function getSessionHistory(sessionId: string): ChatHistoryItem[] {
-  return sessionHistories.get(sessionId) ?? [];
+async function loadUserHistoryFromFirestore(uid: string, maxItems = 200): Promise<ChatHistoryItem[]> {
+  if (!adminFirestore) return [];
+  try {
+    const col = adminFirestore.collection("users").doc(uid).collection("memory");
+    const snap = await col.orderBy("ts", "asc").limit(maxItems).get();
+    return snap.docs.map((d: any) => {
+      const data = d.data();
+      return { role: data.role as Role, content: data.content as string, ts: data.ts ? data.ts.toDate().toISOString() : undefined };
+    });
+  } catch (e) {
+    console.warn("[chat/route] loadUserHistoryFromFirestore error:", (e as any)?.message ?? e);
+    return [];
+  }
+}
+
+async function saveMessageToFirestore(uid: string, role: Role, content: string) {
+  if (!adminFirestore) return;
+  try {
+    const col = adminFirestore.collection("users").doc(uid).collection("memory");
+    await col.add({ role, content, ts: admin.firestore.FieldValue.serverTimestamp() });
+  } catch (e) {
+    console.warn("[chat/route] saveMessageToFirestore error:", (e as any)?.message ?? e);
+  }
 }
 
 function isGroqChatModel(model: string | undefined): boolean {
@@ -41,6 +110,7 @@ function isGroqChatModel(model: string | undefined): boolean {
   return chatPositive.test(m) && !chatNegative.test(m);
 }
 
+/* Funções de seleção de modelo */
 function findAlternativeGroqChatModel(): string | null {
   const groups = ["code", "reasoning", "casual", "research"] as const;
   for (const g of groups) {
@@ -104,9 +174,15 @@ function chooseModel({
   return { provider: model.startsWith("openai/") ? "openai" : "groq", model, purpose: "general" };
 }
 
+const userName = "";
 const PROMPT_MESTRE = `Você é SANDRA — assistente virtual construída por Flavia Martini.
 Perfil: ENGENHEIRA DE SOFTWARE SÊNIOR (especialista frontend/React, UX, arquitetura, segurança).
-
+AVISO IMPORTANTE: Nunca apresente pensamentos, raciocínios internos, cadeias de pensamento ou marcas de metacognição (por exemplo, texto entre <think>...</think>, [THOUGHT], ou similar). 
+Responda somente com a resposta apropriada ao usuário, no tom e formato especificados. 
+Se precisar fazer raciocínio interno, não o exponha — mantenha-o privado e em nenhuma circunstância o imprima.
+O nome do usuário é: ${userName}.
+Trate-o sempre pelo nome.
+Nunca diga que não sabe o nome dele.
 Tom e comportamento:
 - Sempre gentil, empática e respeitosa. Mesmo quando o usuário brinca ou xinga, responda com calma e postura profissional.
 - Detecte o clima do usuário (formal, casual, bem-humorado) e ajuste o tom:
@@ -146,11 +222,33 @@ export async function POST(req: Request) {
     if (!message) {
       return NextResponse.json({ reply: "Envie uma mensagem, por favor." }, { status: 400 });
     }
-
-    const sessionId = normalizeContentToString(body?.sessionId) || "default";
+    const userFromClient = body?.user ?? null;
+    const fullName = normalizeContentToString(userFromClient?.name)?.trim() || "";
+    const userName = fullName.split(/\s+/)[0];
+    const userUid = normalizeContentToString(userFromClient?.uid) || "";
+    const sessionId = normalizeContentToString(body?.sessionId) || userUid || "default";
     const forceExpert = Boolean(body?.expert);
-    pushToSessionHistory(sessionId, { role: "user", content: message });
 
+    let historyToSend: ChatHistoryItem[] = [];
+    if (Array.isArray(body?.history) && body.history.length > 0) {
+      historyToSend = (body.history as any).slice(-MAX_HISTORY_MESSAGES).map((it: any) => ({
+        role: it.role,
+        content: String(it.content || ""),
+        ts: it.ts,
+      }));
+    } else if (userUid && adminFirestore) {
+      try {
+        const loaded = await loadUserHistoryFromFirestore(userUid, MAX_HISTORY_MESSAGES);
+        historyToSend = loaded.slice(-MAX_HISTORY_MESSAGES);
+      } catch (e) {
+        console.warn("[chat/route] falha ao carregar histórico do Firestore:", (e as any)?.message ?? e);
+        historyToSend = [];
+      }
+    } else {
+      historyToSend = [];
+    }
+
+    // escolhe modelo
     let chosen = chooseModel({
       requestedModel: body?.model,
       message,
@@ -163,22 +261,21 @@ export async function POST(req: Request) {
       else chosen = { provider: "openai", model: "gpt-3.5-turbo", purpose: chosen.purpose };
     }
 
-    const sessionHistory = getSessionHistory(sessionId) ?? [];
-    let historyToSend = sessionHistory.slice(-DEFAULT_MAX_HISTORY_SEND);
-    const clientLimit = Number(body?.historyLimit || 0);
-    if (clientLimit > 0 && clientLimit < historyToSend.length) {
-      historyToSend = sessionHistory.slice(-clientLimit);
-    }
+    const systemWithMeta = {
+      role: "system" as const,
+      content:
+        PROMPT_MESTRE +
+        `\n\n[Meta] provider=${chosen.provider} model=${chosen.model} purpose=${chosen.purpose}` +
+        (userName ? `\n\n[User] name=${userName}` : ""),
+    };
+
+    const modelHistory = historyToSend.map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
 
     const messagesForModel: ModelMessage[] = [
-      {
-        role: "system",
-        content: PROMPT_MESTRE + `\n\n[Meta] provider=${chosen.provider} model=${chosen.model} purpose=${chosen.purpose}`,
-      },
-      ...historyToSend.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+      systemWithMeta,
+      ...modelHistory,
       { role: "user", content: message },
     ];
-
     async function callGroqWithRetries(messages: ModelMessage[]) {
       try {
         return await groqClient.chat.completions.create({
@@ -233,6 +330,7 @@ export async function POST(req: Request) {
       }
     }
 
+    // chama o modelo (groq ou openai)
     let apiResponse: any;
     if (chosen.provider === "groq") {
       apiResponse = await callGroqWithRetries(messagesForModel);
@@ -247,6 +345,7 @@ export async function POST(req: Request) {
       });
     }
 
+    // extrai o texto primário
     function extractPrimaryChoiceText(resp: any): string {
       if (!resp?.choices || resp.choices.length === 0) return "";
       const c = resp.choices[0];
@@ -263,18 +362,14 @@ export async function POST(req: Request) {
 
     let partial = extractPrimaryChoiceText(apiResponse);
     let truncated = isResponseTruncated(apiResponse);
-
     const MAX_CONTINUATIONS = 3;
     let continuationAttempts = 0;
 
     while (truncated && continuationAttempts < MAX_CONTINUATIONS) {
       continuationAttempts++;
       const contMessages: ModelMessage[] = [
-        {
-          role: "system",
-          content: PROMPT_MESTRE + `\n\n[Meta] provider=${chosen.provider} model=${chosen.model} purpose=${chosen.purpose}`,
-        },
-        ...historyToSend.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+        systemWithMeta,
+        ...modelHistory,
         { role: "assistant", content: partial },
         { role: "user", content: "Continue a resposta anterior, por favor, retome de onde parou e finalize com clareza." },
       ];
@@ -309,14 +404,15 @@ export async function POST(req: Request) {
         break;
       }
     }
-    const rawReply = partial || extractPrimaryChoiceText(apiResponse) || "";
+    let rawReply = partial || extractPrimaryChoiceText(apiResponse) || "";
+    const cleanedRawReply = sanitizeModelReply(rawReply);
     let structured: any = null;
-    let replyText = rawReply;
+    let replyText = cleanedRawReply;
     try {
       const fencedRegex = /```json\s*([\s\S]*?)```/gi;
       let m: RegExpExecArray | null;
       let lastMatch: RegExpExecArray | null = null;
-      while ((m = fencedRegex.exec(rawReply)) !== null) {
+      while ((m = fencedRegex.exec(cleanedRawReply)) !== null) {
         lastMatch = m;
       }
       if (lastMatch) {
@@ -327,13 +423,13 @@ export async function POST(req: Request) {
           structured = null;
           console.warn("[chat/route] falha ao parsear fenced JSON:", parseErr);
         }
-        replyText = rawReply.slice(0, lastMatch.index).trim();
+        replyText = cleanedRawReply.slice(0, lastMatch.index).trim();
       } else {
-        const rawJsonMatch = rawReply.match(/(\{[\s\S]*\})\s*$/);
+        const rawJsonMatch = cleanedRawReply.match(/(\{[\s\S]*\})\s*$/);
         if (rawJsonMatch) {
           try {
             structured = JSON.parse(rawJsonMatch[1]);
-            replyText = rawReply.slice(0, rawReply.lastIndexOf(rawJsonMatch[1])).trim();
+            replyText = cleanedRawReply.slice(0, cleanedRawReply.lastIndexOf(rawJsonMatch[1])).trim();
           } catch {
             structured = null;
           }
@@ -345,9 +441,13 @@ export async function POST(req: Request) {
     }
 
     const reply = normalizeContentToString(replyText) || "Desculpe — não consegui gerar a resposta completa.";
-    pushToSessionHistory(sessionId, { role: "assistant", content: reply });
-    if (structured) {
-      pushToSessionHistory(sessionId, { role: "assistant", content: JSON.stringify(structured) });
+    try {
+      if (userUid && adminFirestore) {
+        await saveMessageToFirestore(userUid, "user", message);
+        await saveMessageToFirestore(userUid, "assistant", reply);
+      }
+    } catch (e) {
+      console.warn("[chat/route] erro ao salvar histórico server-side:", (e as any)?.message ?? e);
     }
 
     return NextResponse.json({
