@@ -12,6 +12,8 @@
     "@ant-design/icons": "^6.1.0",
     "antd": "^5.28.1",
     "firebase": "^12.6.0",
+    "firebase-admin": "^13.6.0",
+    "firebase-tools": "^14.26.0",
     "framer-motion": "^12.23.25",
     "highlight.js": "^11.11.1",
     "next": "16.0.1",
