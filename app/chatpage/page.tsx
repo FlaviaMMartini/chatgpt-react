@@ -160,7 +160,13 @@ export default function ChatPage() {
       }
 
       const data = await res.json().catch(() => ({}));
-      const replyText = (typeof data?.reply === "string" && data.reply.trim()) || "Desculpa, acho que estou tendo algum problema aqui.";
+      let replyText = "";
+
+      if (data?.reply && data.reply.trim()) {
+        replyText = data.reply.trim();
+      } else if (!data?.structured) {
+        replyText = "Desculpa, acho que estou tendo algum problema aqui.";
+      }
 
       const botMsg: Msg = {
         role: "assistant",
@@ -389,7 +395,7 @@ export default function ChatPage() {
                 </div>
               </div>
             ))}
-             <div ref={messagesEndRef} />
+          <div ref={messagesEndRef} />
         </div>
 
         {/* INPUT */}

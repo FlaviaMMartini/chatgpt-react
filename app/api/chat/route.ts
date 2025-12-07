@@ -229,6 +229,57 @@ export async function POST(req: Request) {
     const sessionId = normalizeContentToString(body?.sessionId) || userUid || "default";
     const forceExpert = Boolean(body?.expert);
 
+    // === Garantir existência do usuário + sessão no Firestore (evita 500 para novos usuários) ===
+    if (adminFirestore) {
+      try {
+        // escolhe um id para o documento: prefere userUid, senão usa sessionId
+        const docUid = userUid || sessionId || "default";
+
+        // referência ao doc de usuário
+        const userDocRef = adminFirestore.collection("users").doc(docUid);
+        const userDocSnap = await userDocRef.get();
+
+        if (!userDocSnap.exists) {
+          // cria o documento do usuário com campos mínimos
+          await userDocRef.set({
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+            displayName: fullName || null,
+            uid: docUid,
+            // qualquer outro campo inicial que faça sentido
+          });
+          console.log(`[chat/route] criado documento de usuário para uid=${docUid}`);
+        } else {
+          // atualiza o lastSeen se já existir
+          await userDocRef.update({
+            lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+          }).catch(() => { });
+        }
+
+        // cria/atualiza um documento de sessão separado (opcional, útil se você controlar sessões)
+        const sessionRef = adminFirestore.collection("sessions").doc(sessionId);
+        const sessionSnap = await sessionRef.get();
+        if (!sessionSnap.exists) {
+          await sessionRef.set({
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+            uid: userUid || null,
+          });
+          console.log(`[chat/route] criado documento de sessão para sessionId=${sessionId}`);
+        } else {
+          await sessionRef.update({
+            lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+            uid: userUid || null,
+          }).catch(() => { });
+        }
+      } catch (e) {
+        // não deixa isso quebrar a request — só loga
+        console.warn("[chat/route] falha ao garantir usuário/sessão no Firestore:", (e as any)?.message ?? e);
+      }
+    }
+    // === fim: garantia Firestore ===
+
+
     let historyToSend: ChatHistoryItem[] = [];
     if (Array.isArray(body?.history) && body.history.length > 0) {
       historyToSend = (body.history as any).slice(-MAX_HISTORY_MESSAGES).map((it: any) => ({
