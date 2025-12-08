@@ -120,12 +120,14 @@ export default function ChatPage() {
     return last;
   }
 
+  // dentro do componente ChatPage (substituir sendMessage)
   const sendMessage = async () => {
     const text = input?.trim();
     if (!text || !user) return;
     setInput("");
     const userMsg: Msg = { role: "user", content: text, ts: new Date().toISOString() };
     setMessages((prev) => [...prev, userMsg]);
+
     try {
       if (typeof saveUserMessage === "function") {
         await saveUserMessage(user.uid, "user", text);
@@ -136,15 +138,16 @@ export default function ChatPage() {
 
     setSending(true);
 
+    // --- timeout + abort controller
+    const controller = new AbortController();
+    const FETCH_TIMEOUT = 12000; // 12s, ajusta se quiser
+    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+
     try {
       const body = {
         message: text,
         sessionId: user.uid,
-        user: {
-          uid: user.uid,
-          name: user.displayName || "",
-          email: user.email || "",
-        },
+        user: { uid: user.uid, name: user.displayName || "", email: user.email || "" },
         history: makeServerHistory([...messages, userMsg], 12),
       };
 
@@ -152,21 +155,57 @@ export default function ChatPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
 
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`API error ${res.status}: ${txt}`);
-      }
+      clearTimeout(timeoutId);
 
+      // tenta ler JSON mesmo em erro pra ter mensagem
       const data = await res.json().catch(() => ({}));
-      let replyText = "";
 
-      if (data?.reply && data.reply.trim()) {
-        replyText = data.reply.trim();
-      } else if (!data?.structured) {
-        replyText = "Desculpa, acho que estou tendo algum problema aqui.";
+      if (!res.ok) {
+        const errText = data?.error || data?.message || `API error ${res.status}`;
+
+        // 400 = erro de configuração/validacao (modelo inválido etc) -> mostrar aviso amigável e não marcar offline
+        if (res.status === 400) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              content: `Erro de configuração no servidor: ${errText}. Vou avisar a Flavia para checar os modelos.`,
+              ts: new Date().toISOString(),
+            },
+          ]);
+          console.warn("API 400:", errText);
+          // aborta o send sem marcar offline
+          clearTimeout(timeoutId);
+          setSending(false);
+          return;
+        }
+
+        // 502 = problema no provedor de modelo (OpenAI/Groq) -> marcar offline
+        if (res.status === 502) {
+          handleOfflineState(`Erro no provedor: ${data?.detail || errText}`);
+          throw new Error(data?.detail || errText);
+        }
+
+        // demais 5xx/erros -> comportamento offline padrão
+        handleOfflineState(errText);
+        throw new Error(errText);
       }
+
+      // sucesso -> se estava offline, marca retorno e adiciona aviso único
+      if (isOffline) {
+        setIsOffline(false);
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: "cai mas voltei 😅", ts: new Date().toISOString() },
+        ]);
+      }
+
+      let replyText = "";
+      if (data?.reply && data.reply.trim()) replyText = data.reply.trim();
+      else if (!data?.structured) replyText = "Desculpa, acho que estou tendo algum problema aqui.";
 
       const botMsg: Msg = {
         role: "assistant",
@@ -175,6 +214,7 @@ export default function ChatPage() {
         meta: { model: data?.model, provider: data?.provider },
       };
       setMessages((prev) => [...prev, botMsg]);
+
       try {
         if (typeof saveUserMessage === "function") {
           await saveUserMessage(user.uid, "assistant", replyText);
@@ -182,6 +222,7 @@ export default function ChatPage() {
       } catch (err) {
         console.warn("saveUserMessage client error (assistant):", err);
       }
+
       if (data?.structured) {
         setMessages((prev) => [
           ...prev,
@@ -194,48 +235,46 @@ export default function ChatPage() {
         ]);
       }
     } catch (err: any) {
+      clearTimeout(timeoutId);
       console.error("sendMessage error:", err);
+
       const errStr = String(err?.message || err);
-      if (errStr.includes("500") || errStr.includes("Internal server error")) {
-        setIsOffline?.(true);
+
+      // Se já estamos offline, não repete a mensagem de "parece que estou offline..."
+      if (!isOffline && (errStr.includes("500") || errStr.includes("Internal server error") || errStr.includes("timeout") || errStr.includes("Failed to fetch") || errStr.includes("abort"))) {
+        setIsOffline(true);
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: "parece que estou offline...", ts: new Date().toISOString() },
+        ]);
+      }
+
+      // fallback visual para outros erros
+      if (!errStr.includes("parece que estou offline")) {
         setMessages((prev) => [
           ...prev,
           {
             role: "assistant",
-            content: "parece que estou offline...",
+            content: errStr || "Erro ao conectar. Tente novamente.",
             ts: new Date().toISOString(),
           },
         ]);
-        setTimeout(() => {
-          setIsOffline?.(false);
-
-          setMessages((prev) => [
-            ...prev,
-            {
-              role: "assistant",
-              content: "cai mas voltei 😅",
-              ts: new Date().toISOString(),
-            },
-          ]);
-        }, 5000);
-
-        return;
       }
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: errStr || "Erro ao conectar. Tente novamente.",
-          ts: new Date().toISOString(),
-        },
-      ]);
-    }
-    finally {
+    } finally {
       setSending(false);
     }
   };
 
-
+  // helper para unificar tratamento de offline (pode ser expandido pra retry)
+  function handleOfflineState(message?: string) {
+    if (!isOffline) {
+      setIsOffline(true);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: message || "parece que estou offline...", ts: new Date().toISOString() },
+      ]);
+    }
+  }
   if (authLoading || loadingHistory) {
     return (
       <div style={{
